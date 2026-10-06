@@ -1,0 +1,5 @@
+executorch==1.5.1
+huggingface_hub==1.33.0
+safetensors==0.8.0
+torch==2.14.1
+transformers==5.17.0
