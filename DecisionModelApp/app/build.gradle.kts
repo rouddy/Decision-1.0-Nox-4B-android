@@ -59,4 +59,6 @@ dependencies {
     implementation(libs.org.pytorch.executorch.android)
     implementation(libs.soloader)
     implementation(libs.fbjni)
+    implementation(libs.tokenizers)
+    implementation(libs.tokenizer.native)
 }

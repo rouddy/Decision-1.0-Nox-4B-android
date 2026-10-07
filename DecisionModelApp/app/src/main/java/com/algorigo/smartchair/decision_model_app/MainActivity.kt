@@ -193,6 +193,31 @@ fun ModelDownloadScreen(modifier: Modifier = Modifier) {
         ) {
             Text(text = loadButtonText)
         }
+
+        Button(
+            onClick = {
+                coroutineScope.launch {
+                    val result = noxModelRunner?.choice(
+                        state = "Customer requests a refund.",
+                        instructions = "Which team should handle this?",
+                        criteria = linkedMapOf(
+                            "billing" to "Payments and refunds",
+                            "technical" to "Product faults"
+                        )
+                    )
+
+                    println("choice = ${result?.choice}")
+                    println("confidence = ${result?.confidence}")
+                    println("probabilities = ${result?.probabilities}")
+                }
+            },
+            enabled = isModelLoaded,
+            modifier = Modifier
+                .height(50.dp)
+                .widthIn(min = 220.dp)
+        ) {
+            Text(text = "Test Model")
+        }
     }
 }
 
