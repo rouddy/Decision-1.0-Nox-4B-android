@@ -10,7 +10,10 @@ import androidx.compose.animation.core.LinearOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -18,6 +21,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -78,8 +82,14 @@ fun ModelDownloadScreen(modifier: Modifier = Modifier) {
     var isDownloading by remember { mutableStateOf(false) }
     var downloadProgress by remember { mutableFloatStateOf(0f) }
 
+    var fileExists by remember { mutableStateOf(modelFile.exists()) }
+    var noxModelRunner by remember { mutableStateOf<NoxModelRunner?>(null) }
+    var isModelLoaded by remember { mutableStateOf(false) }
+    var isModelLoading by remember { mutableStateOf(false) }
+
     LaunchedEffect(modelFile) {
-        if (modelFile.exists()) {
+        fileExists = modelFile.exists()
+        if (fileExists) {
             buttonTitle = "Download Completed"
             isButtonEnabled = false
             isDownloading = false
@@ -92,9 +102,10 @@ fun ModelDownloadScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    Box(
+    Column(
         modifier = modifier,
-        contentAlignment = Alignment.Center
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
     ) {
         ProgressButton(
             text = buttonTitle,
@@ -118,6 +129,7 @@ fun ModelDownloadScreen(modifier: Modifier = Modifier) {
                     )
 
                     if (success) {
+                        fileExists = true
                         buttonTitle = "Download Completed"
                         isButtonEnabled = false
                         isDownloading = false
@@ -132,6 +144,55 @@ fun ModelDownloadScreen(modifier: Modifier = Modifier) {
                 }
             }
         )
+
+        Spacer(modifier = Modifier.height(16.dp))
+
+        val isLoadButtonEnabled = fileExists && !isModelLoading
+        val loadButtonText = when {
+            isModelLoading -> "Loading Model..."
+            isModelLoaded -> "Model Unload"
+            else -> "Model Load"
+        }
+
+        Button(
+            onClick = {
+                if (isModelLoaded) {
+                    noxModelRunner?.destroy()
+                    noxModelRunner = null
+                    isModelLoaded = false
+                    Toast.makeText(context, "Model Unloaded", Toast.LENGTH_SHORT).show()
+                } else {
+                    isModelLoading = true
+                    coroutineScope.launch {
+                        val runner = withContext(Dispatchers.IO) {
+                            try {
+                                val r = NoxModelRunner(context, modelFile.absolutePath)
+                                r.loadModel()
+                                r
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                                null
+                            }
+                        }
+
+                        isModelLoading = false
+                        if (runner != null) {
+                            noxModelRunner = runner
+                            isModelLoaded = true
+                            Toast.makeText(context, "Model Loaded", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(context, "Model Load Failed", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                }
+            },
+            enabled = isLoadButtonEnabled,
+            modifier = Modifier
+                .height(50.dp)
+                .widthIn(min = 220.dp)
+        ) {
+            Text(text = loadButtonText)
+        }
     }
 }
 

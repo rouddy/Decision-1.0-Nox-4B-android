@@ -10,6 +10,8 @@ kotlin = "2.2.10"
 composeBom = "2026.02.01"
 
 executorch = "1.5.1"
+fbjni = "0.8.1"
+soloader = "0.12.1"
 
 [libraries]
 androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
@@ -28,6 +30,8 @@ androidx-compose-ui-test-junit4 = { group = "androidx.compose.ui", name = "ui-te
 androidx-compose-material3 = { group = "androidx.compose.material3", name = "material3" }
 
 org-pytorch-executorch-android = { group = "org.pytorch", name = "executorch-android", version.ref = "executorch" }
+fbjni = { module = "com.facebook.fbjni:fbjni", version.ref = "fbjni" }
+soloader = { module = "com.facebook.soloader:soloader", version.ref = "soloader" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
