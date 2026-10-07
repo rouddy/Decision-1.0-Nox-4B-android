@@ -4,7 +4,15 @@ from pathlib import Path
 import torch
 from torch.export import export
 
-from executorch.exir import EdgeCompileConfig, to_edge
+from executorch.backends.xnnpack.partition.xnnpack_partitioner import (
+    XnnpackPartitioner,
+)
+from executorch.exir import (
+    EdgeCompileConfig,
+    ExecutorchBackendConfig,
+    to_edge_transform_and_lower,
+)
+from executorch.extension.llm.export.quantize import quantize_model_
 
 from transformers import AutoModel
 
@@ -26,7 +34,9 @@ class NoxExportWrapper(torch.nn.Module):
             [batch, num_candidates], int64
 
         candidate_mask:
-            [batch, num_candidates], bool
+            [batch, num_candidates], int64
+            (Android Tensor는 bool을 만들기 번거로우므로 int64로 받고
+            그래프 안에서 bool로 변환한다)
 
         query_positions:
             [batch], int64
@@ -78,7 +88,7 @@ class NoxExportWrapper(torch.nn.Module):
             input_ids=input_ids,
             attention_mask=attention_mask,
             candidate_positions=candidate_positions,
-            candidate_mask=candidate_mask,
+            candidate_mask=candidate_mask.to(torch.bool),
             query_positions=query_positions,
         )
 
@@ -140,19 +150,28 @@ def make_example_inputs(
     #
     # These must point to the final token of each candidate segment.
     #
-    # This example is deliberately simple. For production export,
-    # construct these positions using the exact Decision runtime
-    # tokenizer/prompt construction.
-    candidate_positions = torch.tensor(
-        [
-            [20, 25],
-        ],
-        dtype=torch.long,
-    ).repeat(batch_size, 1)
+    # The graph is exported with a static shape, so the example only
+    # needs num_candidates valid positions inside the non-padding
+    # tokens (the app pads unused slots and masks them out).
+    real_len = int(attention_mask[0].sum().item())
+
+    if real_len < num_candidates + 1:
+        raise ValueError(
+            f"example prompt has {real_len} tokens, "
+            f"needs more than num_candidates={num_candidates}"
+        )
+
+    candidate_positions = (
+        torch.linspace(1, real_len - 2, num_candidates)
+        .round()
+        .to(torch.long)
+        .unsqueeze(0)
+        .repeat(batch_size, 1)
+    )
 
     candidate_mask = torch.ones(
         (batch_size, num_candidates),
-        dtype=torch.bool,
+        dtype=torch.long,
     )
 
     # Last non-padding token is the global query position.
@@ -196,7 +215,21 @@ def main():
     parser.add_argument(
         "--num-candidates",
         type=int,
-        default=2,
+        default=16,
+        help="Static candidate count. Must match NoxModelRunner.maxCandidates.",
+    )
+
+    parser.add_argument(
+        "--group-size",
+        type=int,
+        default=32,
+        help="Group size for int4 weight quantization.",
+    )
+
+    parser.add_argument(
+        "--no-quant",
+        action="store_true",
+        help="Disable 8da4w quantization (fp32, very large).",
     )
 
     parser.add_argument(
@@ -246,7 +279,8 @@ def main():
         ):
             print(name, type(module))
 
-    model.to(device)
+    # XNNPACK runs fp32 activations (int8 dynamic for quantized linears).
+    model.to(device=device, dtype=torch.float32)
 
     tokenizer = model.runtime.tokenizer
 
@@ -273,6 +307,31 @@ def main():
         reference.dtype,
     )
 
+    if not args.no_quant:
+        print(f"Quantizing (8da4w, group_size={args.group_size})...")
+
+        # Linear: int8 dynamic activation + int4 weight (8da4w) -> XNNPACK
+        # Embedding: int8 weight-only (8w) -> quantized embedding_byte kernel
+        quantize_model_(
+            wrapper,
+            qlinear_config="8da4w",
+            qlinear_group_size=args.group_size,
+            qembedding_config="8w",
+            skip_incompatible_shapes=True,
+        )
+
+        with torch.no_grad():
+            quantized = wrapper(*example_inputs)
+
+        print(
+            "Quantized max abs diff:",
+            (quantized - reference).abs().max().item(),
+        )
+        print(
+            "Argmax match:",
+            torch.equal(quantized.argmax(dim=-1), reference.argmax(dim=-1)),
+        )
+
     print("Running torch.export()...")
 
     with torch.no_grad():
@@ -286,20 +345,26 @@ def main():
     # Check exported graph.
     print(exported.graph_module)
 
-    print("Converting to ExecuTorch Edge IR...")
+    print("Converting to ExecuTorch Edge IR (XNNPACK)...")
 
     edge_config = EdgeCompileConfig(
         _check_ir_validity=False,
     )
 
-    edge_manager = to_edge(
+    edge_manager = to_edge_transform_and_lower(
         exported,
+        partitioner=[XnnpackPartitioner()],
         compile_config=edge_config,
     )
 
     print("Converting to ExecuTorch...")
 
-    et_program = edge_manager.to_executorch()
+    et_program = edge_manager.to_executorch(
+        ExecutorchBackendConfig(
+            # Fuse the quantized embedding into embedding_byte.
+            do_quant_fusion_and_const_prop=True,
+        )
+    )
 
     output = Path(args.output)
 
