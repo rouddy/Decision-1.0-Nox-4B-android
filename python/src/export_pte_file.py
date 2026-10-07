@@ -279,14 +279,19 @@ def main():
         ):
             print(name, type(module))
 
-    # XNNPACK runs fp32 activations (int8 dynamic for quantized linears).
-    model.to(device=device, dtype=torch.float32)
+    # Decision1Model.to() rejects dtype arguments ("numerics are fixed"),
+    # so only the device is moved here.
+    model.to(device)
 
     tokenizer = model.runtime.tokenizer
 
     wrapper = NoxExportWrapper(model)
     wrapper.eval()
-    wrapper.to(device)
+
+    # The wrapper holds the plain nn.Module (QwenDecision), which can be cast.
+    # XNNPACK runs fp32 activations (int8 dynamic for quantized linears);
+    # on CPU Decision 1.0 already loads as fp32, so this is a no-op there.
+    wrapper.to(device=device, dtype=torch.float32)
 
     example_inputs = make_example_inputs(
         tokenizer,
