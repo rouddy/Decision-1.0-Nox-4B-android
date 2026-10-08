@@ -10,6 +10,7 @@ import org.pytorch.executorch.Tensor
 import java.io.File
 import java.io.FileOutputStream
 import kotlin.math.exp
+import kotlin.math.ln
 import kotlin.math.max
 
 class NoxModelRunner(
@@ -21,12 +22,11 @@ class NoxModelRunner(
 
     companion object {
         /**
-         * Decision-1.0-Nox-4B main release calibration.
-         *
-         * temperature.json:
-         * 1.3231350559653137
+         * Decision-2.0-Nox-4B has no calibration file
+         * (config.json "calibration": null), so the runtime uses
+         * temperature 1.0 for choice / noul / score.
          */
-        private const val DEFAULT_TEMPERATURE = 1.3231350559653137f
+        private const val DEFAULT_TEMPERATURE = 1.0f
 
         private const val TOKENIZER_ASSET = "nox/tokenizer.json"
     }
@@ -140,13 +140,7 @@ class NoxModelRunner(
             probabilities[it]
         } ?: error("Model returned no candidates")
 
-        val sorted = probabilities.sortedDescending()
-
-        val confidence = if (sorted.size == 1) {
-            1.0f
-        } else {
-            (sorted[0] - sorted[1]).coerceIn(0.0f, 1.0f)
-        }
+        val confidence = entropyConfidence(probabilities)
 
         val probabilityMap = LinkedHashMap<String, Float>()
 
@@ -189,20 +183,7 @@ class NoxModelRunner(
             index.toDouble() * probabilities[index].toDouble()
         }.toFloat()
 
-        val mean = expectedScore.toDouble()
-
-        val variance = probabilities.indices.sumOf { index ->
-            probabilities[index].toDouble() * (index - mean) * (index - mean)
-        }
-
-        val uniformVariance =
-            (probabilities.size.toDouble() * probabilities.size.toDouble() - 1.0) / 12.0
-
-        val confidence = if (uniformVariance <= 0.0) {
-            1.0f
-        } else {
-            (1.0 - variance / uniformVariance).coerceIn(0.0, 1.0).toFloat()
-        }
+        val confidence = entropyConfidence(probabilities)
 
         val legend = LinkedHashMap<String, String>()
 
@@ -327,6 +308,27 @@ class NoxModelRunner(
         return data.copyOf(
             input.candidateKeys.size
         )
+    }
+
+    /**
+     * Decision 2.0 product_answer() confidence (choice / score):
+     * 1 - H(p) / ln(K), clamped to [0, 1].
+     */
+    private fun entropyConfidence(
+        probabilities: FloatArray
+    ): Float {
+
+        if (probabilities.size < 2) {
+            return 1.0f
+        }
+
+        val entropy = -probabilities.sumOf { p ->
+            if (p > 0f) p.toDouble() * ln(p.toDouble()) else 0.0
+        }
+
+        return (1.0 - entropy / ln(probabilities.size.toDouble()))
+            .coerceIn(0.0, 1.0)
+            .toFloat()
     }
 
     private fun softmax(

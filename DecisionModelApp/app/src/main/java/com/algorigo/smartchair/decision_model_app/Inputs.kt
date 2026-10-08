@@ -45,23 +45,23 @@ class NoxPromptBuilder(
     }
 
     /**
-     * Nox의 canonical_json({"key": ..., "description": ...})과
+     * Decision 2.0의 canonical({"key": ..., "description": ...})과
      * 동일한 key ordering을 유지한다.
      *
      * Python implementation:
-     * json.dumps(..., sort_keys=True, separators=(",", ":"))
+     * json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+     *
+     * description이 없는 choice 옵션은 key로 대체하지 않고 null로 쓴다.
      */
     private fun canonicalCandidateJson(
         key: String,
         description: String?
     ): String {
 
-        val resolvedDescription = description ?: key
-
         return buildString {
             append("{")
             append("\"description\":")
-            append(quoteJson(resolvedDescription))
+            append(description?.let { quoteJson(it) } ?: "null")
             append(",")
             append("\"key\":")
             append(quoteJson(key))
@@ -69,8 +69,33 @@ class NoxPromptBuilder(
         }
     }
 
+    /**
+     * Python json.dumps(ensure_ascii=False)의 문자열 escape.
+     *
+     * org.json.JSONObject.quote()는 '/'를 "\/"로 escape하므로
+     * Python과 토큰이 달라진다. 그래서 직접 구현한다.
+     */
     private fun quoteJson(value: String): String {
-        return org.json.JSONObject.quote(value)
+        return buildString {
+            append('"')
+            for (c in value) {
+                when (c) {
+                    '"' -> append("\\\"")
+                    '\\' -> append("\\\\")
+                    '\n' -> append("\\n")
+                    '\r' -> append("\\r")
+                    '\t' -> append("\\t")
+                    '\b' -> append("\\b")
+                    '\u000C' -> append("\\f")
+                    else -> if (c < ' ') {
+                        append(String.format("\\u%04x", c.code))
+                    } else {
+                        append(c)
+                    }
+                }
+            }
+            append('"')
+        }
     }
 
     fun encodeChoice(
@@ -216,7 +241,8 @@ class NoxPromptBuilder(
     }
 
     /**
-     * SystemOne의 Noul은 yes/no 두 후보를 사용한다.
+     * SystemOne의 Noul은 false/true 두 후보를 사용한다.
+     * Decision 2.0 question_to_row()의 기본 description은 "No" / "Yes".
      */
     fun encodeNoul(
         state: String,
@@ -234,8 +260,8 @@ class NoxPromptBuilder(
                     "Options:"
 
         val candidates = listOf(
-            "false" to "The answer to the question is no.",
-            "true" to "The answer to the question is yes."
+            "false" to "No",
+            "true" to "Yes"
         )
 
         val ids = ArrayList<Long>()
