@@ -1,4 +1,5 @@
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -16,12 +17,12 @@ from executorch.extension.llm.export.quantize import quantize_model_
 
 from transformers import AutoModel
 
-MODEL_ID = "vllm-sr/Decision-1.0-Nox-4B"
+MODEL_ID = "vllm-sr/Decision-2.0-Nox-4B"
 
 
 class NoxExportWrapper(torch.nn.Module):
     """
-    ExecuTorch export boundary for Decision-1.0-Nox-4B.
+    ExecuTorch export boundary for Decision-2.0-Nox-4B.
 
     Inputs:
         input_ids:
@@ -49,32 +50,29 @@ class NoxExportWrapper(torch.nn.Module):
     def __init__(self, decision_model):
         super().__init__()
 
-        # Decision1Model
+        # Decision2Model (transformers remote code)
         #
-        # runtime.model
-        #   └── QwenDecision
-        #         ├── backbone
-        #         └── head
-        #
-        # The exact object hierarchy is implementation-dependent, so
-        # find the QwenDecision module recursively.
-        qwen_decision = None
+        # .decision = runtime.backend.model  (DecisionModel, plain nn.Module)
+        #   ├── backbone  (Qwen3_5TextModel)
+        #   └── head      (CandidateHead)
+        decision = getattr(decision_model, "decision", None)
 
-        for module in decision_model.modules():
-            if (
-                hasattr(module, "backbone")
-                and hasattr(module, "head")
-                and callable(getattr(module, "forward", None))
-            ):
-                qwen_decision = module
-                break
-
-        if qwen_decision is None:
+        if not (
+            isinstance(decision, torch.nn.Module)
+            and hasattr(decision, "backbone")
+            and hasattr(decision, "head")
+        ):
             raise RuntimeError(
-                "Could not find QwenDecision module inside Decision1Model"
+                "Could not find DecisionModel (backbone + head) inside Decision2Model"
             )
 
-        self.model = qwen_decision
+        head_variant = decision.metadata.get("head_variant", "shared")
+
+        if head_variant != "shared":
+            # Other head variants also need task_type_ids / score_level_indices.
+            raise RuntimeError(f"Unsupported head_variant: {head_variant}")
+
+        self.model = decision
 
     def forward(
         self,
@@ -93,6 +91,17 @@ class NoxExportWrapper(torch.nn.Module):
         )
 
 
+def canonical(value) -> str:
+    """Decision 2.0 data.canonical()."""
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 def make_example_inputs(
     tokenizer,
     *,
@@ -103,70 +112,72 @@ def make_example_inputs(
 ):
     """
     Creates a representative input for torch.export().
+
+    Follows Decision 2.0 encode() (prompt_version
+    "decision2-segmented-options-global-query-v1"), the same format as
+    NoxPromptBuilder in the app, so the reference / quantized outputs
+    compared below are meaningful.
     """
 
-    # Use a real tokenizer output rather than arbitrary token IDs.
-    text = (
+    prefix = (
         "Context:\n"
-        "Customer requests a refund.\n\n"
+        "The order arrived damaged yesterday. The customer has a receipt "
+        "and asks for a replacement today.\n\n"
         "Task type: choice\n"
         "Question:\n"
-        "Which team should handle this?\n"
-        "Options:\n"
-        "billing: Payments and refunds\n"
-        "technical: Product faults\n"
+        "Which team should handle this request?\n"
+        "Options:"
     )
 
-    encoded = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=seq_len,
-        padding="max_length",
+    teams = [
+        ("returns", "Refunds, replacements and damaged deliveries"),
+        ("billing", "Payments, invoices and charges"),
+        ("technical", "Product setup and faults"),
+    ]
+    teams += [
+        (f"team_{i}", f"Other department number {i}")
+        for i in range(len(teams), num_candidates)
+    ]
+    teams = teams[:num_candidates]
+
+    suffix = (
+        "\n\nSelect the single option best supported by the context "
+        "and instructions.\nDecision:"
     )
 
-    input_ids = encoded["input_ids"]
+    ids = tokenizer.encode(prefix, add_special_tokens=False)
+    endpoints = []
 
-    # Force the exact export sequence length.
-    if input_ids.shape[1] != seq_len:
-        padded = torch.full(
-            (batch_size, seq_len),
-            tokenizer.pad_token_id,
-            dtype=torch.long,
+    for key, description in teams:
+        option = (
+            "\n<option>\n"
+            + canonical({"key": key, "description": description})
+            + "\n</option>"
         )
+        ids.extend(tokenizer.encode(option, add_special_tokens=False))
 
-        length = min(input_ids.shape[1], seq_len)
+        # Candidate position = final token of the option.
+        endpoints.append(len(ids) - 1)
 
-        padded[:, :length] = input_ids[:, :length]
+    ids.extend(tokenizer.encode(suffix, add_special_tokens=False))
 
-        input_ids = padded
+    if len(ids) > seq_len:
+        raise ValueError(f"example prompt has {len(ids)} tokens, seq_len={seq_len}")
 
-    else:
-        input_ids = input_ids.repeat(batch_size, 1)
+    pad_id = tokenizer.pad_token_id
 
-    attention_mask = (input_ids != tokenizer.pad_token_id).to(torch.long)
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
 
-    # Candidate endpoint positions.
-    #
-    # These must point to the final token of each candidate segment.
-    #
-    # The graph is exported with a static shape, so the example only
-    # needs num_candidates valid positions inside the non-padding
-    # tokens (the app pads unused slots and masks them out).
-    real_len = int(attention_mask[0].sum().item())
+    input_ids = torch.full((batch_size, seq_len), pad_id, dtype=torch.long)
+    input_ids[:, : len(ids)] = torch.tensor(ids, dtype=torch.long)
 
-    if real_len < num_candidates + 1:
-        raise ValueError(
-            f"example prompt has {real_len} tokens, "
-            f"needs more than num_candidates={num_candidates}"
-        )
+    attention_mask = torch.zeros((batch_size, seq_len), dtype=torch.long)
+    attention_mask[:, : len(ids)] = 1
 
-    candidate_positions = (
-        torch.linspace(1, real_len - 2, num_candidates)
-        .round()
-        .to(torch.long)
-        .unsqueeze(0)
-        .repeat(batch_size, 1)
+    candidate_positions = torch.tensor(
+        [endpoints] * batch_size,
+        dtype=torch.long,
     )
 
     candidate_mask = torch.ones(
@@ -175,7 +186,7 @@ def make_example_inputs(
     )
 
     # Last non-padding token is the global query position.
-    query_positions = (attention_mask.sum(dim=1) - 1).to(torch.long)
+    query_positions = torch.full((batch_size,), len(ids) - 1, dtype=torch.long)
 
     return (
         input_ids.to(device),
@@ -196,7 +207,7 @@ def main():
 
     parser.add_argument(
         "--output",
-        default="decision_nox_4b.pte",
+        default="decision2_nox_4b.pte",
     )
 
     parser.add_argument(
@@ -229,7 +240,7 @@ def main():
     parser.add_argument(
         "--no-quant",
         action="store_true",
-        help="Disable 8da4w quantization (fp32, very large).",
+        help="Disable 8da4w quantization (fp32, ~17 GB; does not fit on a phone).",
     )
 
     parser.add_argument(
@@ -247,9 +258,13 @@ def main():
 
     print(f"Loading {args.model}")
 
+    # Decision2Model.to() rejects dtype arguments ("numerics are fixed"),
+    # and without `device` the runtime picks cuda:0 when a GPU is visible,
+    # so the device is chosen at load time.
     model = AutoModel.from_pretrained(
         args.model,
         trust_remote_code=True,
+        device=str(device),
     )
 
     model.eval()
@@ -279,18 +294,15 @@ def main():
         ):
             print(name, type(module))
 
-    # Decision1Model.to() rejects dtype arguments ("numerics are fixed"),
-    # so only the device is moved here.
-    model.to(device)
-
-    tokenizer = model.runtime.tokenizer
+    tokenizer = model.runtime.backend.tokenizer
 
     wrapper = NoxExportWrapper(model)
     wrapper.eval()
 
-    # The wrapper holds the plain nn.Module (QwenDecision), which can be cast.
+    # The wrapper holds the plain nn.Module (DecisionModel), which can be cast.
     # XNNPACK runs fp32 activations (int8 dynamic for quantized linears);
-    # on CPU Decision 1.0 already loads as fp32, so this is a no-op there.
+    # on CPU Decision 2.0 already loads as fp32, so this is a no-op there
+    # (on a GPU the runtime keeps BF16 Linear weights).
     wrapper.to(device=device, dtype=torch.float32)
 
     example_inputs = make_example_inputs(
@@ -313,12 +325,15 @@ def main():
     )
 
     if not args.no_quant:
-        print(f"Quantizing (8da4w, group_size={args.group_size})...")
+        print(f"Quantizing backbone (8da4w, group_size={args.group_size})...")
 
+        # Backbone only: the candidate head is small and runs in FP32 in
+        # the reference runtime, so it is kept FP32 here as well.
+        #
         # Linear: int8 dynamic activation + int4 weight (8da4w) -> XNNPACK
         # Embedding: int8 weight-only (8w) -> quantized embedding_byte kernel
         quantize_model_(
-            wrapper,
+            wrapper.model.backbone,
             qlinear_config="8da4w",
             qlinear_group_size=args.group_size,
             qembedding_config="8w",
@@ -328,6 +343,14 @@ def main():
         with torch.no_grad():
             quantized = wrapper(*example_inputs)
 
+        print(
+            "Reference probabilities:",
+            torch.softmax(reference, dim=-1)[0, :4].tolist(),
+        )
+        print(
+            "Quantized probabilities:",
+            torch.softmax(quantized, dim=-1)[0, :4].tolist(),
+        )
         print(
             "Quantized max abs diff:",
             (quantized - reference).abs().max().item(),
